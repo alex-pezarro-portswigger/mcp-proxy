@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -19,8 +20,10 @@ type Client struct {
 	name            string
 	needPing        bool
 	needManualStart bool
+	needLazyLoad    bool
 	client          *client.Client
 	options         *OptionsV2
+	toolsCache      *toolsCache
 }
 
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
@@ -49,6 +52,18 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
 		}
+
+		// Add header function to forward Authorization from context
+		options = append(options, transport.WithHeaderFunc(
+			func(ctx context.Context) map[string]string {
+				headers := make(map[string]string)
+				if authHeader, ok := authHeaderFromContext(ctx); ok {
+					headers["Authorization"] = authHeader
+				}
+				return headers
+			},
+		))
+
 		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
 		if err != nil {
 			return nil, err
@@ -68,6 +83,18 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		if v.Timeout > 0 {
 			options = append(options, transport.WithHTTPTimeout(v.Timeout))
 		}
+
+		// Add header function to forward Authorization from context
+		options = append(options, transport.WithHTTPHeaderFunc(
+			func(ctx context.Context) map[string]string {
+				headers := make(map[string]string)
+				if authHeader, ok := authHeaderFromContext(ctx); ok {
+					headers["Authorization"] = authHeader
+				}
+				return headers
+			},
+		))
+
 		mcpClient, err := client.NewStreamableHttpClient(v.URL, options...)
 		if err != nil {
 			return nil, err
@@ -325,6 +352,15 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		handler = server.NewStreamableHTTPServer(
 			mcpServer,
 			server.WithStateLess(true),
+			server.WithHTTPContextFunc(
+				func(ctx context.Context, r *http.Request) context.Context {
+					authHeader := r.Header.Get("Authorization")
+					if authHeader != "" {
+						return withAuthHeader(ctx, authHeader)
+					}
+					return ctx
+				},
+			),
 		)
 	default:
 		return nil, fmt.Errorf("unknown server type: %s", serverConfig.Type)
