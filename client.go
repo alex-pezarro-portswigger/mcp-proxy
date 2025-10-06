@@ -72,8 +72,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			name:            name,
 			needPing:        true,
 			needManualStart: true,
+			needLazyLoad:    true, // Enable lazy loading for HTTP-based servers
 			client:          mcpClient,
 			options:         conf.Options,
+			toolsCache:      newToolsCache(),
 		}, nil
 	case *StreamableMCPClientConfig:
 		var options []transport.StreamableHTTPCOption
@@ -103,8 +105,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			name:            name,
 			needPing:        true,
 			needManualStart: true,
+			needLazyLoad:    true, // Enable lazy loading for HTTP-based servers
 			client:          mcpClient,
 			options:         conf.Options,
+			toolsCache:      newToolsCache(),
 		}, nil
 	}
 	return nil, errors.New("invalid client type")
@@ -131,10 +135,17 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	}
 	log.Printf("<%s> Successfully initialized MCP client", c.name)
 
-	err = c.addToolsToServer(ctx, mcpServer)
-	if err != nil {
-		return err
+	// Skip tool loading for lazy-loaded servers (OAuth-protected servers)
+	// Tools will be loaded on-demand when authenticated requests come in
+	if !c.needLazyLoad {
+		err = c.addToolsToServer(ctx, mcpServer)
+		if err != nil {
+			return err
+		}
+	} else {
+		log.Printf("<%s> Lazy loading enabled - tools will be loaded on first authenticated request", c.name)
 	}
+
 	_ = c.addPromptsToServer(ctx, mcpServer)
 	_ = c.addResourcesToServer(ctx, mcpServer)
 	_ = c.addResourceTemplatesToServer(ctx, mcpServer)
@@ -318,13 +329,119 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// toolsCache caches tools fetched with different auth tokens
+type toolsCache struct {
+	mu    sync.RWMutex
+	cache map[string][]server.ServerTool // authToken -> tools
+}
+
+func newToolsCache() *toolsCache {
+	return &toolsCache{
+		cache: make(map[string][]server.ServerTool),
+	}
+}
+
+func (tc *toolsCache) get(authToken string) ([]server.ServerTool, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	tools, ok := tc.cache[authToken]
+	return tools, ok
+}
+
+func (tc *toolsCache) set(authToken string, tools []server.ServerTool) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.cache[authToken] = tools
+}
+
+// loadToolsForAuth fetches tools with the given auth context and caches them
+func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, error) {
+	authToken, hasAuth := authHeaderFromContext(ctx)
+	if !hasAuth {
+		authToken = "" // Use empty string for unauthenticated requests
+	}
+
+	// Check cache first
+	if tools, ok := c.toolsCache.get(authToken); ok {
+		log.Printf("<%s> Using cached tools (%d tools)", c.name, len(tools))
+		return tools, nil
+	}
+
+	// Fetch tools
+	log.Printf("<%s> Fetching tools with auth context", c.name)
+	toolsRequest := mcp.ListToolsRequest{}
+	filterFunc := func(toolName string) bool {
+		return true
+	}
+
+	if c.options != nil && c.options.ToolFilter != nil && len(c.options.ToolFilter.List) > 0 {
+		filterSet := make(map[string]struct{})
+		mode := ToolFilterMode(strings.ToLower(string(c.options.ToolFilter.Mode)))
+		for _, toolName := range c.options.ToolFilter.List {
+			filterSet[toolName] = struct{}{}
+		}
+		switch mode {
+		case ToolFilterModeAllow:
+			filterFunc = func(toolName string) bool {
+				_, inList := filterSet[toolName]
+				if !inList {
+					log.Printf("<%s> Ignoring tool %s as it is not in allow list", c.name, toolName)
+				}
+				return inList
+			}
+		case ToolFilterModeBlock:
+			filterFunc = func(toolName string) bool {
+				_, inList := filterSet[toolName]
+				if inList {
+					log.Printf("<%s> Ignoring tool %s as it is in block list", c.name, toolName)
+				}
+				return !inList
+			}
+		default:
+			log.Printf("<%s> Unknown tool filter mode: %s, skipping tool filter", c.name, mode)
+		}
+	}
+
+	var serverTools []server.ServerTool
+	for {
+		tools, err := c.client.ListTools(ctx, toolsRequest)
+		if err != nil {
+			return nil, err
+		}
+		if len(tools.Tools) == 0 {
+			break
+		}
+		log.Printf("<%s> Successfully listed %d tools", c.name, len(tools.Tools))
+		for _, tool := range tools.Tools {
+			if filterFunc(tool.Name) {
+				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
+				serverTools = append(serverTools, server.ServerTool{
+					Tool:    tool,
+					Handler: c.client.CallTool,
+				})
+			}
+		}
+		if tools.NextCursor == "" {
+			break
+		}
+		toolsRequest.Params.Cursor = tools.NextCursor
+	}
+
+	// Cache the tools
+	c.toolsCache.set(authToken, serverTools)
+	log.Printf("<%s> Cached %d tools for auth token", c.name, len(serverTools))
+
+	return serverTools, nil
+}
+
 type Server struct {
 	tokens    []string
 	mcpServer *server.MCPServer
 	handler   http.Handler
+	client    *Client // Reference to client for lazy loading
 }
 
-func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCPClientConfigV2) (*Server, error) {
+func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCPClientConfigV2, client *Client) (*Server, error) {
 	serverOpts := []server.ServerOption{
 		server.WithResourceCapabilities(true, true),
 		server.WithRecovery(),
@@ -333,11 +450,65 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 	if clientConfig.Options.LogEnabled.OrElse(false) {
 		serverOpts = append(serverOpts, server.WithLogging())
 	}
+
 	mcpServer := server.NewMCPServer(
 		name,
 		serverConfig.Version,
 		serverOpts...,
 	)
+
+	// Add lazy loading hooks for OAuth-protected servers
+	if client.needLazyLoad {
+		// Shared function to load and register tools
+		loadAndRegisterTools := func(ctx context.Context) error {
+			tools, err := client.loadToolsForAuth(ctx)
+			if err != nil {
+				return err
+			}
+
+			// Register tools globally so they can be called
+			// This is safe to call multiple times - AddTool will overwrite existing tools
+			for _, serverTool := range tools {
+				mcpServer.AddTool(serverTool.Tool, serverTool.Handler)
+			}
+
+			return nil
+		}
+
+		// Hook to populate tools list dynamically based on auth context
+		onAfterListTools := func(ctx context.Context, id any, message *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
+			// Load and register tools for the current auth context
+			if err := loadAndRegisterTools(ctx); err != nil {
+				log.Printf("<%s> Failed to load tools: %v", name, err)
+				return
+			}
+		}
+
+		// Hook to ensure tools are loaded before any tool call
+		onBeforeCallTool := func(ctx context.Context, id any, message *mcp.CallToolRequest) {
+			// Ensure tools are loaded and registered for this auth context
+			if err := loadAndRegisterTools(ctx); err != nil {
+				log.Printf("<%s> Failed to load tools before call: %v", name, err)
+			}
+		}
+
+		// Apply hooks using the server's internal hooks
+		// We need to recreate the server with hooks
+		hooks := &server.Hooks{
+			OnAfterListTools:   []server.OnAfterListToolsFunc{onAfterListTools},
+			OnBeforeCallTool:   []server.OnBeforeCallToolFunc{onBeforeCallTool},
+		}
+
+		// Re-create server with hooks
+		serverOpts = append([]server.ServerOption{}, serverOpts...)
+		serverOpts = append(serverOpts, server.WithHooks(hooks))
+
+		mcpServer = server.NewMCPServer(
+			name,
+			serverConfig.Version,
+			serverOpts...,
+		)
+	}
 
 	var handler http.Handler
 
@@ -368,6 +539,7 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 	srv := &Server{
 		mcpServer: mcpServer,
 		handler:   handler,
+		client:    client,
 	}
 
 	if clientConfig.Options != nil && len(clientConfig.Options.AuthTokens) > 0 {

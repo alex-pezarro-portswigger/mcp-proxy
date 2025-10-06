@@ -135,7 +135,7 @@ func startHTTPServer(config *Config) error {
 		if err != nil {
 			return err
 		}
-		server, err := newMCPServer(name, config.McpProxy, clientConfig)
+		server, err := newMCPServer(name, config.McpProxy, clientConfig, mcpClient)
 		if err != nil {
 			return err
 		}
