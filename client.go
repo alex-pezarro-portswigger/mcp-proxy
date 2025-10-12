@@ -24,10 +24,17 @@ type Client struct {
 	needPing        bool
 	needManualStart bool
 	needLazyLoad    bool
-	serverURL       string // URL of the MCP server (for OAuth detection)
+	isInitialized   bool       // Track if client has been successfully initialized
+	isStarted       bool       // Track if client has been started
+	initMu          sync.Mutex // Protect initialization
+	serverURL       string     // URL of the MCP server (for OAuth detection)
 	client          *client.Client
 	options         *OptionsV2
 	toolsCache      *toolsCache
+
+	// Deferred client creation fields for OAuth-protected servers
+	deferredSSEConfig        *SSEMCPClientConfig
+	deferredStreamableConfig *StreamableMCPClientConfig
 }
 
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
@@ -52,6 +59,27 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			options: conf.Options,
 		}, nil
 	case *SSEMCPClientConfig:
+		// Check if server requires OAuth upfront
+		ctx := context.Background()
+		requiresOAuth := checkOAuthSupport(ctx, v.URL, name)
+
+		if requiresOAuth {
+			// Defer client creation - store config for later
+			log.Printf("<%s> OAuth detected - deferring client creation until authenticated request", name)
+			return &Client{
+				name:              name,
+				needPing:          true,
+				needManualStart:   true,
+				needLazyLoad:      true,
+				serverURL:         v.URL,
+				client:            nil, // Client will be created on first authenticated request
+				options:           conf.Options,
+				toolsCache:        newToolsCache(),
+				deferredSSEConfig: v,
+			}, nil
+		}
+
+		// Create client immediately for non-OAuth servers
 		var options []transport.ClientOption
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
@@ -76,13 +104,34 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			name:            name,
 			needPing:        true,
 			needManualStart: true,
-			needLazyLoad:    false, // Will be enabled if OAuth is detected
+			needLazyLoad:    false,
 			serverURL:       v.URL,
 			client:          mcpClient,
 			options:         conf.Options,
 			toolsCache:      newToolsCache(),
 		}, nil
 	case *StreamableMCPClientConfig:
+		// Check if server requires OAuth upfront
+		ctx := context.Background()
+		requiresOAuth := checkOAuthSupport(ctx, v.URL, name)
+
+		if requiresOAuth {
+			// Defer client creation - store config for later
+			log.Printf("<%s> OAuth detected - deferring client creation until authenticated request", name)
+			return &Client{
+				name:                     name,
+				needPing:                 true,
+				needManualStart:          true,
+				needLazyLoad:             true,
+				serverURL:                v.URL,
+				client:                   nil, // Client will be created on first authenticated request
+				options:                  conf.Options,
+				toolsCache:               newToolsCache(),
+				deferredStreamableConfig: v,
+			}, nil
+		}
+
+		// Create client immediately for non-OAuth servers
 		var options []transport.StreamableHTTPCOption
 		if len(v.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(v.Headers))
@@ -110,7 +159,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			name:            name,
 			needPing:        true,
 			needManualStart: true,
-			needLazyLoad:    false, // Will be enabled if OAuth is detected
+			needLazyLoad:    false,
 			serverURL:       v.URL,
 			client:          mcpClient,
 			options:         conf.Options,
@@ -121,18 +170,20 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 }
 
 func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
-	if c.needManualStart {
+	// If lazy loading is enabled, skip all initialization
+	// Client will be created and initialized on first authenticated request
+	if c.needLazyLoad {
+		log.Printf("<%s> Lazy loading enabled - client will be created on first authenticated request", c.name)
+		return nil
+	}
+
+	// Regular initialization for non-OAuth servers
+	if c.needManualStart && !c.isStarted {
 		err := c.client.Start(ctx)
 		if err != nil {
-			// Check if this is a 401 error and if the server supports OAuth
-			if c.is401Error(err) && c.checkOAuthSupport(ctx) {
-				log.Printf("<%s> Server requires OAuth authentication - enabling lazy loading", c.name)
-				c.needLazyLoad = true
-				// Don't return error - we'll handle this with lazy loading
-				return nil
-			}
 			return err
 		}
+		c.isStarted = true
 	}
 	initRequest := mcp.InitializeRequest{}
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
@@ -145,7 +196,7 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	_, err := c.client.Initialize(ctx, initRequest)
 	if err != nil {
 		// Check if this is a 401 error and if the server supports OAuth
-		if c.is401Error(err) && c.checkOAuthSupport(ctx) {
+		if c.is401Error(err) && checkOAuthSupport(ctx, c.serverURL, c.name) {
 			log.Printf("<%s> Server requires OAuth authentication - enabling lazy loading", c.name)
 			c.needLazyLoad = true
 			// Don't return error - we'll handle this with lazy loading
@@ -153,24 +204,20 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 		}
 		return err
 	}
+	c.isInitialized = true
 	log.Printf("<%s> Successfully initialized MCP client", c.name)
 
-	// Skip tool loading for lazy-loaded servers (OAuth-protected servers)
-	// Tools will be loaded on-demand when authenticated requests come in
-	if !c.needLazyLoad {
-		err = c.addToolsToServer(ctx, mcpServer)
-		if err != nil {
-			// Check if this is a 401 error for tool loading
-			if c.is401Error(err) && c.checkOAuthSupport(ctx) {
-				log.Printf("<%s> Server requires OAuth authentication for tools - enabling lazy loading", c.name)
-				c.needLazyLoad = true
-				// Don't return error - we'll handle this with lazy loading
-				return nil
-			}
-			return err
+	// Add tools immediately for non-lazy-loaded servers
+	err = c.addToolsToServer(ctx, mcpServer)
+	if err != nil {
+		// Check if this is a 401 error for tool loading
+		if c.is401Error(err) && checkOAuthSupport(ctx, c.serverURL, c.name) {
+			log.Printf("<%s> Server requires OAuth authentication for tools - enabling lazy loading", c.name)
+			c.needLazyLoad = true
+			// Don't return error - we'll handle this with lazy loading
+			return nil
 		}
-	} else {
-		log.Printf("<%s> Lazy loading enabled - tools will be loaded on first authenticated request", c.name)
+		return err
 	}
 
 	_ = c.addPromptsToServer(ctx, mcpServer)
@@ -368,29 +415,102 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// checkOAuthSupport checks if the server supports OAuth by looking for OAuth metadata endpoints
-func (c *Client) checkOAuthSupport(ctx context.Context) bool {
-	if c.serverURL == "" {
+// ensureClientCreated creates the MCP client if it hasn't been created yet (for lazy-loaded OAuth servers)
+// This is called when the first authenticated request comes in
+func (c *Client) ensureClientCreated(ctx context.Context) error {
+	// If client already exists, nothing to do
+	if c.client != nil {
+		return nil
+	}
+
+	// For OAuth-protected servers, require authentication before creating the client
+	if c.needLazyLoad {
+		if _, hasAuth := authHeaderFromContext(ctx); !hasAuth {
+			return fmt.Errorf("OAuth authentication required - please provide Authorization header")
+		}
+	}
+
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+
+	// Double-check after acquiring lock
+	if c.client != nil {
+		return nil
+	}
+
+	// Create client based on stored config
+	if c.deferredSSEConfig != nil {
+		var options []transport.ClientOption
+		if len(c.deferredSSEConfig.Headers) > 0 {
+			options = append(options, client.WithHeaders(c.deferredSSEConfig.Headers))
+		}
+
+		// Add header function to forward Authorization from context
+		options = append(options, transport.WithHeaderFunc(
+			func(ctx context.Context) map[string]string {
+				headers := make(map[string]string)
+				if authHeader, ok := authHeaderFromContext(ctx); ok {
+					headers["Authorization"] = authHeader
+				}
+				return headers
+			},
+		))
+
+		mcpClient, err := client.NewSSEMCPClient(c.deferredSSEConfig.URL, options...)
+		if err != nil {
+			return fmt.Errorf("failed to create SSE client: %w", err)
+		}
+		c.client = mcpClient
+	} else if c.deferredStreamableConfig != nil {
+		var options []transport.StreamableHTTPCOption
+		if len(c.deferredStreamableConfig.Headers) > 0 {
+			options = append(options, transport.WithHTTPHeaders(c.deferredStreamableConfig.Headers))
+		}
+		if c.deferredStreamableConfig.Timeout > 0 {
+			options = append(options, transport.WithHTTPTimeout(c.deferredStreamableConfig.Timeout))
+		}
+
+		// Add header function to forward Authorization from context
+		options = append(options, transport.WithHTTPHeaderFunc(
+			func(ctx context.Context) map[string]string {
+				headers := make(map[string]string)
+				if authHeader, ok := authHeaderFromContext(ctx); ok {
+					headers["Authorization"] = authHeader
+				}
+				return headers
+			},
+		))
+
+		mcpClient, err := client.NewStreamableHttpClient(c.deferredStreamableConfig.URL, options...)
+		if err != nil {
+			return fmt.Errorf("failed to create Streamable HTTP client: %w", err)
+		}
+		c.client = mcpClient
+	} else {
+		return fmt.Errorf("no deferred client configuration found")
+	}
+
+	return nil
+}
+
+func checkOAuthSupport(ctx context.Context, serverURL string, serverName string) bool {
+	if serverURL == "" {
 		return false
 	}
 
-	// Parse the server URL to get the base URL
-	parsedURL, err := url.Parse(c.serverURL)
+	parsedURL, err := url.Parse(serverURL)
 	if err != nil {
 		return false
 	}
 
-	// Build base URL (scheme + host)
 	baseURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
 
-	// List of OAuth metadata endpoints to check
 	metadataEndpoints := []string{
 		"/.well-known/oauth-authorization-server",
 		"/.well-known/openid-configuration",
 	}
 
-	// Check each endpoint with a timeout
-	client := &http.Client{
+	httpClient := &http.Client{
 		Timeout: 5 * time.Second,
 	}
 
@@ -401,13 +521,12 @@ func (c *Client) checkOAuthSupport(ctx context.Context) bool {
 			continue
 		}
 
-		resp, err := client.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			continue
 		}
 		defer resp.Body.Close()
 
-		// If we get a 200 response, check if it's valid JSON with OAuth metadata
 		if resp.StatusCode == http.StatusOK {
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
@@ -419,13 +538,12 @@ func (c *Client) checkOAuthSupport(ctx context.Context) bool {
 				continue
 			}
 
-			// Check for OAuth-specific fields
 			if _, hasIssuer := metadata["issuer"]; hasIssuer {
-				log.Printf("<%s> Detected OAuth support at %s", c.name, checkURL)
+				log.Printf("<%s> Detected OAuth support at %s", serverName, checkURL)
 				return true
 			}
 			if _, hasAuthEndpoint := metadata["authorization_endpoint"]; hasAuthEndpoint {
-				log.Printf("<%s> Detected OAuth support at %s", c.name, checkURL)
+				log.Printf("<%s> Detected OAuth support at %s", serverName, checkURL)
 				return true
 			}
 		}
@@ -459,21 +577,56 @@ func (tc *toolsCache) set(authToken string, tools []server.ServerTool) {
 	tc.cache[authToken] = tools
 }
 
-// loadToolsForAuth fetches tools with the given auth context and caches them
 func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, error) {
 	authToken, hasAuth := authHeaderFromContext(ctx)
 	if !hasAuth {
-		authToken = "" // Use empty string for unauthenticated requests
+		authToken = ""
 	}
 
-	// Check cache first
 	if tools, ok := c.toolsCache.get(authToken); ok {
-		log.Printf("<%s> Using cached tools (%d tools)", c.name, len(tools))
 		return tools, nil
 	}
 
+	if err := c.ensureClientCreated(ctx); err != nil {
+		return nil, fmt.Errorf("failed to create client: %w", err)
+	}
+
+	if !c.isInitialized {
+		c.initMu.Lock()
+		defer c.initMu.Unlock()
+
+		if c.isInitialized {
+			return c.loadToolsForAuth(ctx)
+		}
+
+		if c.needManualStart && !c.isStarted {
+			if err := c.client.Start(ctx); err != nil {
+				return nil, fmt.Errorf("failed to start client: %w", err)
+			}
+			c.isStarted = true
+		}
+
+		initRequest := mcp.InitializeRequest{}
+		initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+		initRequest.Params.ClientInfo = mcp.Implementation{
+			Name:    "mcp-proxy",
+			Version: "1.0.0",
+		}
+		initRequest.Params.Capabilities = mcp.ClientCapabilities{
+			Experimental: make(map[string]interface{}),
+			Roots:        nil,
+			Sampling:     nil,
+		}
+
+		if _, err := c.client.Initialize(ctx, initRequest); err != nil {
+			return nil, fmt.Errorf("failed to initialize client: %w", err)
+		}
+
+		c.isInitialized = true
+		log.Printf("<%s> Successfully initialized MCP client", c.name)
+	}
+
 	// Fetch tools
-	log.Printf("<%s> Fetching tools with auth context", c.name)
 	toolsRequest := mcp.ListToolsRequest{}
 	filterFunc := func(toolName string) bool {
 		return true
@@ -508,6 +661,7 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 	}
 
 	var serverTools []server.ServerTool
+	totalToolsListed := 0
 	for {
 		tools, err := c.client.ListTools(ctx, toolsRequest)
 		if err != nil {
@@ -516,7 +670,7 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 		if len(tools.Tools) == 0 {
 			break
 		}
-		log.Printf("<%s> Successfully listed %d tools", c.name, len(tools.Tools))
+		totalToolsListed += len(tools.Tools)
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
 				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
@@ -532,9 +686,12 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 		toolsRequest.Params.Cursor = tools.NextCursor
 	}
 
+	log.Printf("<%s> Successfully listed %d tools", c.name, totalToolsListed)
+
 	// Cache the tools
 	c.toolsCache.set(authToken, serverTools)
-	log.Printf("<%s> Cached %d tools for auth token", c.name, len(serverTools))
+
+	log.Printf("<%s> Connected", c.name)
 
 	return serverTools, nil
 }
@@ -543,12 +700,14 @@ type Server struct {
 	tokens    []string
 	mcpServer *server.MCPServer
 	handler   http.Handler
-	client    *Client // Reference to client for lazy loading
+	client    *Client
 }
 
 func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCPClientConfigV2, client *Client) (*Server, error) {
 	serverOpts := []server.ServerOption{
+		server.WithToolCapabilities(true),
 		server.WithResourceCapabilities(true, true),
+		server.WithPromptCapabilities(true),
 		server.WithRecovery(),
 	}
 
@@ -562,24 +721,25 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		serverOpts...,
 	)
 
-	// Add lazy loading hooks for HTTP-based servers
-	// Hooks are always set up for HTTP servers, but only activate if needLazyLoad is true
-	// This allows for dynamic OAuth detection during initialization
 	if client.serverURL != "" {
-		// Shared function to load and register tools
 		loadAndRegisterTools := func(ctx context.Context) error {
-			// Only load if lazy loading is enabled (may be set dynamically)
 			if !client.needLazyLoad {
+				log.Printf("<%s> Lazy loading not enabled, skipping tool load", name)
 				return nil
 			}
 
-			tools, err := client.loadToolsForAuth(ctx)
-			if err != nil {
-				return err
+			var initCtx context.Context
+			if authHeader, ok := authHeaderFromContext(ctx); ok {
+				initCtx = withAuthHeader(context.Background(), authHeader)
+			} else {
+				initCtx = context.Background()
 			}
 
-			// Register tools globally so they can be called
-			// This is safe to call multiple times - AddTool will overwrite existing tools
+			tools, err := client.loadToolsForAuth(initCtx)
+			if err != nil {
+				return fmt.Errorf("loadToolsForAuth failed: %w", err)
+			}
+
 			for _, serverTool := range tools {
 				mcpServer.AddTool(serverTool.Tool, serverTool.Handler)
 			}
@@ -587,18 +747,14 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 			return nil
 		}
 
-		// Hook to populate tools list dynamically based on auth context
-		onAfterListTools := func(ctx context.Context, id any, message *mcp.ListToolsRequest, result *mcp.ListToolsResult) {
-			// Load and register tools for the current auth context
+		onBeforeListTools := func(ctx context.Context, id any, message *mcp.ListToolsRequest) {
 			if err := loadAndRegisterTools(ctx); err != nil {
 				log.Printf("<%s> Failed to load tools: %v", name, err)
 				return
 			}
 		}
 
-		// Hook to ensure tools are loaded before any tool call
 		onBeforeCallTool := func(ctx context.Context, id any, message *mcp.CallToolRequest) {
-			// Ensure tools are loaded and registered for this auth context
 			if err := loadAndRegisterTools(ctx); err != nil {
 				log.Printf("<%s> Failed to load tools before call: %v", name, err)
 			}
@@ -607,8 +763,8 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		// Apply hooks using the server's internal hooks
 		// We need to recreate the server with hooks
 		hooks := &server.Hooks{
-			OnAfterListTools: []server.OnAfterListToolsFunc{onAfterListTools},
-			OnBeforeCallTool: []server.OnBeforeCallToolFunc{onBeforeCallTool},
+			OnBeforeListTools: []server.OnBeforeListToolsFunc{onBeforeListTools},
+			OnBeforeCallTool:  []server.OnBeforeCallToolFunc{onBeforeCallTool},
 		}
 
 		// Re-create server with hooks

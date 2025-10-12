@@ -65,6 +65,22 @@ func newAuthMiddleware(tokens []string) MiddlewareFunc {
 	}
 }
 
+// newOAuthRequiredMiddleware creates middleware that requires an Authorization header
+// (but doesn't validate it - validation happens at the OAuth server)
+func newOAuthRequiredMiddleware(serverName string) MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				log.Printf("<%s> Request rejected - OAuth authentication required", serverName)
+				http.Error(w, "Unauthorized - OAuth authentication required", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 func loggerMiddleware(prefix string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,7 +163,11 @@ func startHTTPServer(config *Config) error {
 		if clientConfig.Options.LogEnabled.OrElse(false) {
 			middlewares = append(middlewares, loggerMiddleware(name))
 		}
-		if len(clientConfig.Options.AuthTokens) > 0 {
+		// For OAuth-protected servers, require Authorization header (but don't validate token)
+		if mcpClient.needLazyLoad {
+			middlewares = append(middlewares, newOAuthRequiredMiddleware(name))
+		} else if len(clientConfig.Options.AuthTokens) > 0 {
+			// For non-OAuth servers with configured tokens, validate against token list
 			middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
 		}
 		mcpRoute := path.Join(baseURL.Path, name)
