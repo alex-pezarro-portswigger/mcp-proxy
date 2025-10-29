@@ -84,10 +84,81 @@ func newOAuthRequiredMiddleware(serverName string) MiddlewareFunc {
 func loggerMiddleware(prefix string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("<%s> Request [%s] %s", prefix, r.Method, r.URL.Path)
-			next.ServeHTTP(w, r)
+			// Log incoming request from client
+			log.Printf("<%s> > %s %s %s", prefix, r.Method, r.URL.RequestURI(), r.Proto)
+			log.Printf("<%s> > Host: %s", prefix, r.Host)
+			for name, values := range r.Header {
+				for _, value := range values {
+					log.Printf("<%s> > %s: %s", prefix, name, value)
+				}
+			}
+			log.Printf("<%s> >", prefix)
+
+			// Wrap response writer to capture outgoing response
+			loggingWriter := &loggingResponseWriter{
+				ResponseWriter: w,
+				prefix:         prefix,
+			}
+
+			next.ServeHTTP(loggingWriter, r)
+
+			// Log outgoing response to client
+			loggingWriter.logResponse()
 		})
 	}
+}
+
+// loggingResponseWriter wraps http.ResponseWriter to capture response details
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	prefix        string
+	statusCode    int
+	headerLogged  bool
+	responseLogged bool
+}
+
+func (lw *loggingResponseWriter) WriteHeader(statusCode int) {
+	lw.statusCode = statusCode
+	lw.logResponseHeader()
+	lw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (lw *loggingResponseWriter) Write(data []byte) (int, error) {
+	if lw.statusCode == 0 {
+		lw.statusCode = http.StatusOK
+		lw.logResponseHeader()
+	}
+	return lw.ResponseWriter.Write(data)
+}
+
+func (lw *loggingResponseWriter) logResponseHeader() {
+	if lw.headerLogged {
+		return
+	}
+	lw.headerLogged = true
+
+	statusText := http.StatusText(lw.statusCode)
+	if statusText == "" {
+		statusText = "Unknown"
+	}
+	log.Printf("<%s> ≤ HTTP/1.1 %d %s", lw.prefix, lw.statusCode, statusText)
+	for name, values := range lw.Header() {
+		for _, value := range values {
+			log.Printf("<%s> ≤ %s: %s", lw.prefix, name, value)
+		}
+	}
+}
+
+func (lw *loggingResponseWriter) logResponse() {
+	if lw.responseLogged {
+		return
+	}
+	lw.responseLogged = true
+
+	if !lw.headerLogged {
+		lw.logResponseHeader()
+	}
+	log.Printf("<%s> ≤", lw.prefix)
 }
 
 func recoverMiddleware(prefix string) MiddlewareFunc {
@@ -95,12 +166,154 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
+					// Check if this is an authentication error
+					if authErr, ok := err.(interface {
+						Error() string
+						StatusCode() int
+						Headers() http.Header
+					}); ok {
+						statusCode := authErr.StatusCode()
+						if statusCode == 401 {
+							log.Printf("<%s> Authentication error: %v", prefix, err)
+
+							// Copy headers from MCP server response to client response
+							headers := authErr.Headers()
+							if headers != nil {
+								for name, values := range headers {
+									for _, value := range values {
+										w.Header().Add(name, value)
+									}
+								}
+							}
+
+							// Set status code and send response
+							w.WriteHeader(http.StatusUnauthorized)
+							w.Write([]byte("Unauthorized\n"))
+							return
+						}
+					}
+					// For other panics, return 500
 					log.Printf("<%s> Recovered from panic: %v", prefix, err)
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				}
 			}()
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// new401DetectionMiddleware creates middleware that detects 401 errors in JSON-RPC responses
+// and sets the HTTP status code to 401 to signal clients that authentication needs refresh
+func new401DetectionMiddleware(serverName string) MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Create a response wrapper to capture the response
+			wrapper := &responseWrapper{
+				ResponseWriter: w,
+				statusCode:     http.StatusOK, // Default status
+				serverName:     serverName,
+			}
+
+			// Call the next handler with our wrapper
+			next.ServeHTTP(wrapper, r)
+
+			// After the handler completes, check if we need to modify the status
+			wrapper.finalizeResponse()
+		})
+	}
+}
+
+// responseWrapper wraps http.ResponseWriter to intercept and potentially modify responses
+type responseWrapper struct {
+	http.ResponseWriter
+	statusCode     int
+	headerWritten  bool
+	serverName     string
+	bodyBuf        []byte
+	isStreaming    bool
+	checkedStreaming bool
+}
+
+func (rw *responseWrapper) WriteHeader(statusCode int) {
+	if rw.headerWritten {
+		return
+	}
+	rw.statusCode = statusCode
+	rw.checkIfStreaming()
+
+	// If streaming, write headers immediately
+	if rw.isStreaming {
+		rw.ResponseWriter.WriteHeader(rw.statusCode)
+		rw.headerWritten = true
+	}
+}
+
+func (rw *responseWrapper) checkIfStreaming() {
+	if rw.checkedStreaming {
+		return
+	}
+	rw.checkedStreaming = true
+
+	// Check if this is a streaming response (SSE or other streaming types)
+	contentType := rw.Header().Get("Content-Type")
+	rw.isStreaming = strings.Contains(contentType, "text/event-stream") ||
+		strings.Contains(contentType, "application/x-ndjson") ||
+		strings.Contains(contentType, "multipart/")
+}
+
+func (rw *responseWrapper) Write(data []byte) (int, error) {
+	rw.checkIfStreaming()
+
+	// For streaming responses, pass through immediately
+	if rw.isStreaming {
+		if !rw.headerWritten {
+			if rw.statusCode == 0 {
+				rw.statusCode = http.StatusOK
+			}
+			rw.ResponseWriter.WriteHeader(rw.statusCode)
+			rw.headerWritten = true
+		}
+		return rw.ResponseWriter.Write(data)
+	}
+
+	// For non-streaming, buffer the response
+	rw.bodyBuf = append(rw.bodyBuf, data...)
+	return len(data), nil
+}
+
+func (rw *responseWrapper) finalizeResponse() {
+	if rw.headerWritten {
+		return
+	}
+
+	// Check if this is a JSON response that might contain a 401 error
+	contentType := rw.Header().Get("Content-Type")
+	if strings.Contains(contentType, "application/json") && len(rw.bodyBuf) > 0 {
+		// Parse as JSON to check for errors
+		bodyStr := string(rw.bodyBuf)
+
+		// Check for JSON-RPC error with 401 patterns
+		// Look for error objects containing 401, "Unauthorized", or "unauthorized"
+		if strings.Contains(bodyStr, `"error"`) &&
+			(strings.Contains(bodyStr, "401") ||
+				strings.Contains(bodyStr, "Unauthorized") ||
+				strings.Contains(bodyStr, "unauthorized")) {
+
+			// Change status to 401
+			log.Printf("<%s> Detected 401 error in response, setting HTTP status to 401", rw.serverName)
+			rw.statusCode = http.StatusUnauthorized
+		}
+	}
+
+	// Now write the actual response
+	if rw.statusCode == 0 {
+		rw.statusCode = http.StatusOK
+	}
+	rw.ResponseWriter.WriteHeader(rw.statusCode)
+	rw.headerWritten = true
+
+	if len(rw.bodyBuf) > 0 {
+		rw.ResponseWriter.Write(rw.bodyBuf)
 	}
 }
 
@@ -170,6 +383,8 @@ func startHTTPServer(config *Config) error {
 			// For non-OAuth servers with configured tokens, validate against token list
 			middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
 		}
+		// Add 401 detection middleware to propagate authentication errors to clients
+		middlewares = append(middlewares, new401DetectionMiddleware(name))
 		mcpRoute := path.Join(baseURL.Path, name)
 		if !strings.HasPrefix(mcpRoute, "/") {
 			mcpRoute = "/" + mcpRoute
@@ -292,6 +507,16 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 		backendURLParsed, _ := url.Parse(backendURL)
 		proxyReq.Host = backendURLParsed.Host
 
+		// Log outgoing request to backend MCP server
+		log.Printf("<%s> ≥ %s %s %s", serverName, proxyReq.Method, proxyReq.URL.RequestURI(), proxyReq.Proto)
+		log.Printf("<%s> ≥ Host: %s", serverName, proxyReq.Host)
+		for name, values := range proxyReq.Header {
+			for _, value := range values {
+				log.Printf("<%s> ≥ %s: %s", serverName, name, value)
+			}
+		}
+		log.Printf("<%s> ≥", serverName)
+
 		// Execute proxy request
 		client := &http.Client{
 			Timeout: 30 * time.Second,
@@ -303,6 +528,15 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 			return
 		}
 		defer resp.Body.Close()
+
+		// Log incoming response from backend MCP server
+		log.Printf("<%s> < HTTP/1.1 %d %s", serverName, resp.StatusCode, resp.Status)
+		for name, values := range resp.Header {
+			for _, value := range values {
+				log.Printf("<%s> < %s: %s", serverName, name, value)
+			}
+		}
+		log.Printf("<%s> <", serverName)
 
 		// Copy response headers
 		for name, values := range resp.Header {

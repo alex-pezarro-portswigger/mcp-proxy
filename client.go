@@ -37,6 +37,94 @@ type Client struct {
 	deferredStreamableConfig *StreamableMCPClientConfig
 }
 
+// loggingRoundTripper wraps an http.RoundTripper to log requests and responses
+type loggingRoundTripper struct {
+	transport  http.RoundTripper
+	serverName string
+	logEnabled bool
+}
+
+// responseHeadersKey is used to store response headers in context
+type responseHeadersKey struct{}
+
+func (lrt *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if lrt.logEnabled {
+		// Log outgoing request to MCP server
+		log.Printf("<%s> ≥ %s %s %s", lrt.serverName, req.Method, req.URL.RequestURI(), req.Proto)
+		log.Printf("<%s> ≥ Host: %s", lrt.serverName, req.URL.Host)
+		for name, values := range req.Header {
+			for _, value := range values {
+				log.Printf("<%s> ≥ %s: %s", lrt.serverName, name, value)
+			}
+		}
+		log.Printf("<%s> ≥", lrt.serverName)
+	}
+
+	// Perform the actual request
+	resp, err := lrt.transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if lrt.logEnabled {
+		// Log incoming response from MCP server
+		statusText := http.StatusText(resp.StatusCode)
+		if statusText == "" {
+			statusText = resp.Status
+		} else {
+			statusText = fmt.Sprintf("%d %s", resp.StatusCode, statusText)
+		}
+		log.Printf("<%s> < %s %s", lrt.serverName, resp.Proto, statusText)
+		for name, values := range resp.Header {
+			for _, value := range values {
+				log.Printf("<%s> < %s: %s", lrt.serverName, name, value)
+			}
+		}
+		log.Printf("<%s> <", lrt.serverName)
+	}
+
+	// Store response headers if this is a 401 response
+	if resp.StatusCode == http.StatusUnauthorized {
+		// Clone headers to avoid mutation issues
+		headersCopy := make(http.Header)
+		for k, v := range resp.Header {
+			headersCopy[k] = v
+		}
+		// Store using client name as key
+		storeLast401Headers(lrt.serverName, headersCopy)
+	}
+
+	return resp, nil
+}
+
+// last401HeadersStore stores response headers from 401 responses for propagation to clients
+// Keyed by client name since we need to retrieve across different contexts
+var last401HeadersStore sync.Map
+
+func storeLast401Headers(clientName string, headers http.Header) {
+	last401HeadersStore.Store(clientName, headers)
+}
+
+func getLast401Headers(clientName string) (http.Header, bool) {
+	if headers, ok := last401HeadersStore.Load(clientName); ok {
+		last401HeadersStore.Delete(clientName) // Clean up after retrieval
+		return headers.(http.Header), true
+	}
+	return nil, false
+}
+
+// newLoggingHTTPClient creates an HTTP client with logging capability
+func newLoggingHTTPClient(serverName string, logEnabled bool) *http.Client {
+	return &http.Client{
+		Transport: &loggingRoundTripper{
+			transport:  http.DefaultTransport,
+			serverName: serverName,
+			logEnabled: logEnabled,
+		},
+		Timeout: 30 * time.Second,
+	}
+}
+
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	clientInfo, pErr := parseMCPClientConfigV2(conf)
 	if pErr != nil {
@@ -81,6 +169,11 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 
 		// Create client immediately for non-OAuth servers
 		var options []transport.ClientOption
+
+		// Add logging HTTP client if logging is enabled
+		logEnabled := conf.Options.LogEnabled.OrElse(false)
+		options = append(options, transport.WithHTTPClient(newLoggingHTTPClient(name, logEnabled)))
+
 		if len(v.Headers) > 0 {
 			options = append(options, client.WithHeaders(v.Headers))
 		}
@@ -133,6 +226,11 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 
 		// Create client immediately for non-OAuth servers
 		var options []transport.StreamableHTTPCOption
+
+		// Add logging HTTP client if logging is enabled
+		logEnabled := conf.Options.LogEnabled.OrElse(false)
+		options = append(options, transport.WithHTTPBasicClient(newLoggingHTTPClient(name, logEnabled)))
+
 		if len(v.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(v.Headers))
 		}
@@ -441,6 +539,11 @@ func (c *Client) ensureClientCreated(ctx context.Context) error {
 	// Create client based on stored config
 	if c.deferredSSEConfig != nil {
 		var options []transport.ClientOption
+
+		// Add logging HTTP client if logging is enabled
+		logEnabled := c.options.LogEnabled.OrElse(false)
+		options = append(options, transport.WithHTTPClient(newLoggingHTTPClient(c.name, logEnabled)))
+
 		if len(c.deferredSSEConfig.Headers) > 0 {
 			options = append(options, client.WithHeaders(c.deferredSSEConfig.Headers))
 		}
@@ -463,6 +566,11 @@ func (c *Client) ensureClientCreated(ctx context.Context) error {
 		c.client = mcpClient
 	} else if c.deferredStreamableConfig != nil {
 		var options []transport.StreamableHTTPCOption
+
+		// Add logging HTTP client if logging is enabled
+		logEnabled := c.options.LogEnabled.OrElse(false)
+		options = append(options, transport.WithHTTPBasicClient(newLoggingHTTPClient(c.name, logEnabled)))
+
 		if len(c.deferredStreamableConfig.Headers) > 0 {
 			options = append(options, transport.WithHTTPHeaders(c.deferredStreamableConfig.Headers))
 		}
@@ -577,6 +685,25 @@ func (tc *toolsCache) set(authToken string, tools []server.ServerTool) {
 	tc.cache[authToken] = tools
 }
 
+// authError is a special error type for authentication failures that should be propagated to clients
+type authError struct {
+	statusCode int
+	message    string
+	headers    http.Header // Headers from the MCP server response
+}
+
+func (e *authError) Error() string {
+	return e.message
+}
+
+func (e *authError) StatusCode() int {
+	return e.statusCode
+}
+
+func (e *authError) Headers() http.Header {
+	return e.headers
+}
+
 func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, error) {
 	authToken, hasAuth := authHeaderFromContext(ctx)
 	if !hasAuth {
@@ -601,6 +728,10 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 
 		if c.needManualStart && !c.isStarted {
 			if err := c.client.Start(ctx); err != nil {
+				if c.is401Error(err) {
+					headers, _ := getLast401Headers(c.name)
+					return nil, &authError{statusCode: 401, message: fmt.Sprintf("Authentication required: %v", err), headers: headers}
+				}
 				return nil, fmt.Errorf("failed to start client: %w", err)
 			}
 			c.isStarted = true
@@ -619,6 +750,10 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 		}
 
 		if _, err := c.client.Initialize(ctx, initRequest); err != nil {
+			if c.is401Error(err) {
+				headers, _ := getLast401Headers(c.name)
+				return nil, &authError{statusCode: 401, message: fmt.Sprintf("Authentication required: %v", err), headers: headers}
+			}
 			return nil, fmt.Errorf("failed to initialize client: %w", err)
 		}
 
@@ -665,6 +800,10 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 	for {
 		tools, err := c.client.ListTools(ctx, toolsRequest)
 		if err != nil {
+			if c.is401Error(err) {
+				headers, _ := getLast401Headers(c.name)
+				return nil, &authError{statusCode: 401, message: fmt.Sprintf("Authentication required: %v", err), headers: headers}
+			}
 			return nil, err
 		}
 		if len(tools.Tools) == 0 {
@@ -750,6 +889,11 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		onBeforeListTools := func(ctx context.Context, id any, message *mcp.ListToolsRequest) {
 			if err := loadAndRegisterTools(ctx); err != nil {
 				log.Printf("<%s> Failed to load tools: %v", name, err)
+				// Panic with authError to propagate authentication errors to client
+				var authErr *authError
+				if errors.As(err, &authErr) {
+					panic(authErr)
+				}
 				return
 			}
 		}
@@ -757,6 +901,11 @@ func newMCPServer(name string, serverConfig *MCPProxyConfigV2, clientConfig *MCP
 		onBeforeCallTool := func(ctx context.Context, id any, message *mcp.CallToolRequest) {
 			if err := loadAndRegisterTools(ctx); err != nil {
 				log.Printf("<%s> Failed to load tools before call: %v", name, err)
+				// Panic with authError to propagate authentication errors to client
+				var authErr *authError
+				if errors.As(err, &authErr) {
+					panic(authErr)
+				}
 			}
 		}
 
