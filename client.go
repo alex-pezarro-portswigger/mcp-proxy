@@ -24,15 +24,14 @@ type Client struct {
 	needPing        bool
 	needManualStart bool
 	needLazyLoad    bool
-	isInitialized   bool       // Track if client has been successfully initialized
-	isStarted       bool       // Track if client has been started
-	initMu          sync.Mutex // Protect initialization
-	serverURL       string     // URL of the MCP server (for OAuth detection)
+	isInitialized   bool
+	isStarted       bool
+	initMu          sync.Mutex
+	serverURL       string
 	client          *client.Client
 	options         *OptionsV2
 	toolsCache      *toolsCache
 
-	// Deferred client creation fields for OAuth-protected servers
 	deferredSSEConfig        *SSEMCPClientConfig
 	deferredStreamableConfig *StreamableMCPClientConfig
 }
@@ -44,12 +43,10 @@ type loggingRoundTripper struct {
 	logEnabled bool
 }
 
-// responseHeadersKey is used to store response headers in context
 type responseHeadersKey struct{}
 
 func (lrt *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if lrt.logEnabled {
-		// Log outgoing request to MCP server
 		log.Printf("<%s> ≥ %s %s %s", lrt.serverName, req.Method, req.URL.RequestURI(), req.Proto)
 		log.Printf("<%s> ≥ Host: %s", lrt.serverName, req.URL.Host)
 		for name, values := range req.Header {
@@ -60,14 +57,12 @@ func (lrt *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 		log.Printf("<%s> ≥", lrt.serverName)
 	}
 
-	// Perform the actual request
 	resp, err := lrt.transport.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
 
 	if lrt.logEnabled {
-		// Log incoming response from MCP server
 		statusText := http.StatusText(resp.StatusCode)
 		if statusText == "" {
 			statusText = resp.Status
@@ -83,22 +78,18 @@ func (lrt *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 		log.Printf("<%s> <", lrt.serverName)
 	}
 
-	// Store response headers if this is a 401 response
 	if resp.StatusCode == http.StatusUnauthorized {
-		// Clone headers to avoid mutation issues
 		headersCopy := make(http.Header)
 		for k, v := range resp.Header {
 			headersCopy[k] = v
 		}
-		// Store using client name as key
 		storeLast401Headers(lrt.serverName, headersCopy)
 	}
 
 	return resp, nil
 }
 
-// last401HeadersStore stores response headers from 401 responses for propagation to clients
-// Keyed by client name since we need to retrieve across different contexts
+// last401HeadersStore caches 401 response headers for propagation to clients
 var last401HeadersStore sync.Map
 
 func storeLast401Headers(clientName string, headers http.Header) {
@@ -107,7 +98,7 @@ func storeLast401Headers(clientName string, headers http.Header) {
 
 func getLast401Headers(clientName string) (http.Header, bool) {
 	if headers, ok := last401HeadersStore.Load(clientName); ok {
-		last401HeadersStore.Delete(clientName) // Clean up after retrieval
+		last401HeadersStore.Delete(clientName)
 		return headers.(http.Header), true
 	}
 	return nil, false
@@ -123,6 +114,53 @@ func newLoggingHTTPClient(serverName string, logEnabled bool) *http.Client {
 		},
 		Timeout: 30 * time.Second,
 	}
+}
+
+func configureSSEOptions(name string, config *SSEMCPClientConfig, logEnabled bool) []transport.ClientOption {
+	var options []transport.ClientOption
+
+	options = append(options, transport.WithHTTPClient(newLoggingHTTPClient(name, logEnabled)))
+
+	if len(config.Headers) > 0 {
+		options = append(options, client.WithHeaders(config.Headers))
+	}
+
+	options = append(options, transport.WithHeaderFunc(
+		func(ctx context.Context) map[string]string {
+			headers := make(map[string]string)
+			if authHeader, ok := authHeaderFromContext(ctx); ok {
+				headers["Authorization"] = authHeader
+			}
+			return headers
+		},
+	))
+
+	return options
+}
+
+func configureStreamableOptions(name string, config *StreamableMCPClientConfig, logEnabled bool) []transport.StreamableHTTPCOption {
+	var options []transport.StreamableHTTPCOption
+
+	options = append(options, transport.WithHTTPBasicClient(newLoggingHTTPClient(name, logEnabled)))
+
+	if len(config.Headers) > 0 {
+		options = append(options, transport.WithHTTPHeaders(config.Headers))
+	}
+	if config.Timeout > 0 {
+		options = append(options, transport.WithHTTPTimeout(config.Timeout))
+	}
+
+	options = append(options, transport.WithHTTPHeaderFunc(
+		func(ctx context.Context) map[string]string {
+			headers := make(map[string]string)
+			if authHeader, ok := authHeaderFromContext(ctx); ok {
+				headers["Authorization"] = authHeader
+			}
+			return headers
+		},
+	))
+
+	return options
 }
 
 func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
@@ -147,12 +185,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			options: conf.Options,
 		}, nil
 	case *SSEMCPClientConfig:
-		// Check if server requires OAuth upfront
 		ctx := context.Background()
 		requiresOAuth := checkOAuthSupport(ctx, v.URL, name)
 
 		if requiresOAuth {
-			// Defer client creation - store config for later
 			log.Printf("<%s> OAuth detected - deferring client creation until authenticated request", name)
 			return &Client{
 				name:              name,
@@ -160,34 +196,15 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				needManualStart:   true,
 				needLazyLoad:      true,
 				serverURL:         v.URL,
-				client:            nil, // Client will be created on first authenticated request
+				client:            nil,
 				options:           conf.Options,
 				toolsCache:        newToolsCache(),
 				deferredSSEConfig: v,
 			}, nil
 		}
 
-		// Create client immediately for non-OAuth servers
-		var options []transport.ClientOption
-
-		// Add logging HTTP client if logging is enabled
 		logEnabled := conf.Options.LogEnabled.OrElse(false)
-		options = append(options, transport.WithHTTPClient(newLoggingHTTPClient(name, logEnabled)))
-
-		if len(v.Headers) > 0 {
-			options = append(options, client.WithHeaders(v.Headers))
-		}
-
-		// Add header function to forward Authorization from context
-		options = append(options, transport.WithHeaderFunc(
-			func(ctx context.Context) map[string]string {
-				headers := make(map[string]string)
-				if authHeader, ok := authHeaderFromContext(ctx); ok {
-					headers["Authorization"] = authHeader
-				}
-				return headers
-			},
-		))
+		options := configureSSEOptions(name, v, logEnabled)
 
 		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
 		if err != nil {
@@ -204,12 +221,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 			toolsCache:      newToolsCache(),
 		}, nil
 	case *StreamableMCPClientConfig:
-		// Check if server requires OAuth upfront
 		ctx := context.Background()
 		requiresOAuth := checkOAuthSupport(ctx, v.URL, name)
 
 		if requiresOAuth {
-			// Defer client creation - store config for later
 			log.Printf("<%s> OAuth detected - deferring client creation until authenticated request", name)
 			return &Client{
 				name:                     name,
@@ -217,37 +232,15 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 				needManualStart:          true,
 				needLazyLoad:             true,
 				serverURL:                v.URL,
-				client:                   nil, // Client will be created on first authenticated request
+				client:                   nil,
 				options:                  conf.Options,
 				toolsCache:               newToolsCache(),
 				deferredStreamableConfig: v,
 			}, nil
 		}
 
-		// Create client immediately for non-OAuth servers
-		var options []transport.StreamableHTTPCOption
-
-		// Add logging HTTP client if logging is enabled
 		logEnabled := conf.Options.LogEnabled.OrElse(false)
-		options = append(options, transport.WithHTTPBasicClient(newLoggingHTTPClient(name, logEnabled)))
-
-		if len(v.Headers) > 0 {
-			options = append(options, transport.WithHTTPHeaders(v.Headers))
-		}
-		if v.Timeout > 0 {
-			options = append(options, transport.WithHTTPTimeout(v.Timeout))
-		}
-
-		// Add header function to forward Authorization from context
-		options = append(options, transport.WithHTTPHeaderFunc(
-			func(ctx context.Context) map[string]string {
-				headers := make(map[string]string)
-				if authHeader, ok := authHeaderFromContext(ctx); ok {
-					headers["Authorization"] = authHeader
-				}
-				return headers
-			},
-		))
+		options := configureStreamableOptions(name, v, logEnabled)
 
 		mcpClient, err := client.NewStreamableHttpClient(v.URL, options...)
 		if err != nil {
@@ -268,14 +261,11 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 }
 
 func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
-	// If lazy loading is enabled, skip all initialization
-	// Client will be created and initialized on first authenticated request
 	if c.needLazyLoad {
 		log.Printf("<%s> Lazy loading enabled - client will be created on first authenticated request", c.name)
 		return nil
 	}
 
-	// Regular initialization for non-OAuth servers
 	if c.needManualStart && !c.isStarted {
 		err := c.client.Start(ctx)
 		if err != nil {
@@ -293,11 +283,9 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	}
 	_, err := c.client.Initialize(ctx, initRequest)
 	if err != nil {
-		// Check if this is a 401 error and if the server supports OAuth
 		if c.is401Error(err) && checkOAuthSupport(ctx, c.serverURL, c.name) {
 			log.Printf("<%s> Server requires OAuth authentication - enabling lazy loading", c.name)
 			c.needLazyLoad = true
-			// Don't return error - we'll handle this with lazy loading
 			return nil
 		}
 		return err
@@ -305,14 +293,11 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 	c.isInitialized = true
 	log.Printf("<%s> Successfully initialized MCP client", c.name)
 
-	// Add tools immediately for non-lazy-loaded servers
 	err = c.addToolsToServer(ctx, mcpServer)
 	if err != nil {
-		// Check if this is a 401 error for tool loading
 		if c.is401Error(err) && checkOAuthSupport(ctx, c.serverURL, c.name) {
 			log.Printf("<%s> Server requires OAuth authentication for tools - enabling lazy loading", c.name)
 			c.needLazyLoad = true
-			// Don't return error - we'll handle this with lazy loading
 			return nil
 		}
 		return err
@@ -513,15 +498,12 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// ensureClientCreated creates the MCP client if it hasn't been created yet (for lazy-loaded OAuth servers)
-// This is called when the first authenticated request comes in
+// ensureClientCreated creates the MCP client for lazy-loaded OAuth servers
 func (c *Client) ensureClientCreated(ctx context.Context) error {
-	// If client already exists, nothing to do
 	if c.client != nil {
 		return nil
 	}
 
-	// For OAuth-protected servers, require authentication before creating the client
 	if c.needLazyLoad {
 		if _, hasAuth := authHeaderFromContext(ctx); !hasAuth {
 			return fmt.Errorf("OAuth authentication required - please provide Authorization header")
@@ -531,33 +513,13 @@ func (c *Client) ensureClientCreated(ctx context.Context) error {
 	c.initMu.Lock()
 	defer c.initMu.Unlock()
 
-	// Double-check after acquiring lock
 	if c.client != nil {
 		return nil
 	}
 
-	// Create client based on stored config
 	if c.deferredSSEConfig != nil {
-		var options []transport.ClientOption
-
-		// Add logging HTTP client if logging is enabled
 		logEnabled := c.options.LogEnabled.OrElse(false)
-		options = append(options, transport.WithHTTPClient(newLoggingHTTPClient(c.name, logEnabled)))
-
-		if len(c.deferredSSEConfig.Headers) > 0 {
-			options = append(options, client.WithHeaders(c.deferredSSEConfig.Headers))
-		}
-
-		// Add header function to forward Authorization from context
-		options = append(options, transport.WithHeaderFunc(
-			func(ctx context.Context) map[string]string {
-				headers := make(map[string]string)
-				if authHeader, ok := authHeaderFromContext(ctx); ok {
-					headers["Authorization"] = authHeader
-				}
-				return headers
-			},
-		))
+		options := configureSSEOptions(c.name, c.deferredSSEConfig, logEnabled)
 
 		mcpClient, err := client.NewSSEMCPClient(c.deferredSSEConfig.URL, options...)
 		if err != nil {
@@ -565,29 +527,8 @@ func (c *Client) ensureClientCreated(ctx context.Context) error {
 		}
 		c.client = mcpClient
 	} else if c.deferredStreamableConfig != nil {
-		var options []transport.StreamableHTTPCOption
-
-		// Add logging HTTP client if logging is enabled
 		logEnabled := c.options.LogEnabled.OrElse(false)
-		options = append(options, transport.WithHTTPBasicClient(newLoggingHTTPClient(c.name, logEnabled)))
-
-		if len(c.deferredStreamableConfig.Headers) > 0 {
-			options = append(options, transport.WithHTTPHeaders(c.deferredStreamableConfig.Headers))
-		}
-		if c.deferredStreamableConfig.Timeout > 0 {
-			options = append(options, transport.WithHTTPTimeout(c.deferredStreamableConfig.Timeout))
-		}
-
-		// Add header function to forward Authorization from context
-		options = append(options, transport.WithHTTPHeaderFunc(
-			func(ctx context.Context) map[string]string {
-				headers := make(map[string]string)
-				if authHeader, ok := authHeaderFromContext(ctx); ok {
-					headers["Authorization"] = authHeader
-				}
-				return headers
-			},
-		))
+		options := configureStreamableOptions(c.name, c.deferredStreamableConfig, logEnabled)
 
 		mcpClient, err := client.NewStreamableHttpClient(c.deferredStreamableConfig.URL, options...)
 		if err != nil {
@@ -660,10 +601,9 @@ func checkOAuthSupport(ctx context.Context, serverURL string, serverName string)
 	return false
 }
 
-// toolsCache caches tools fetched with different auth tokens
 type toolsCache struct {
 	mu    sync.RWMutex
-	cache map[string][]server.ServerTool // authToken -> tools
+	cache map[string][]server.ServerTool
 }
 
 func newToolsCache() *toolsCache {
@@ -685,11 +625,10 @@ func (tc *toolsCache) set(authToken string, tools []server.ServerTool) {
 	tc.cache[authToken] = tools
 }
 
-// authError is a special error type for authentication failures that should be propagated to clients
 type authError struct {
 	statusCode int
 	message    string
-	headers    http.Header // Headers from the MCP server response
+	headers    http.Header
 }
 
 func (e *authError) Error() string {
@@ -761,7 +700,6 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 		log.Printf("<%s> Successfully initialized MCP client", c.name)
 	}
 
-	// Fetch tools
 	toolsRequest := mcp.ListToolsRequest{}
 	filterFunc := func(toolName string) bool {
 		return true
@@ -827,7 +765,6 @@ func (c *Client) loadToolsForAuth(ctx context.Context) ([]server.ServerTool, err
 
 	log.Printf("<%s> Successfully listed %d tools", c.name, totalToolsListed)
 
-	// Cache the tools
 	c.toolsCache.set(authToken, serverTools)
 
 	log.Printf("<%s> Connected", c.name)

@@ -20,15 +20,12 @@ import (
 
 type MiddlewareFunc func(http.Handler) http.Handler
 
-// authHeaderKey is a context key for storing Authorization headers
 type authHeaderKey struct{}
 
-// withAuthHeader adds an auth header to context
 func withAuthHeader(ctx context.Context, authHeader string) context.Context {
 	return context.WithValue(ctx, authHeaderKey{}, authHeader)
 }
 
-// authHeaderFromContext extracts auth header from context
 func authHeaderFromContext(ctx context.Context) (string, bool) {
 	auth, ok := ctx.Value(authHeaderKey{}).(string)
 	return auth, ok
@@ -65,8 +62,6 @@ func newAuthMiddleware(tokens []string) MiddlewareFunc {
 	}
 }
 
-// newOAuthRequiredMiddleware creates middleware that requires an Authorization header
-// (but doesn't validate it - validation happens at the OAuth server)
 func newOAuthRequiredMiddleware(serverName string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,7 +79,6 @@ func newOAuthRequiredMiddleware(serverName string) MiddlewareFunc {
 func loggerMiddleware(prefix string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Log incoming request from client
 			log.Printf("<%s> > %s %s %s", prefix, r.Method, r.URL.RequestURI(), r.Proto)
 			log.Printf("<%s> > Host: %s", prefix, r.Host)
 			for name, values := range r.Header {
@@ -94,7 +88,6 @@ func loggerMiddleware(prefix string) MiddlewareFunc {
 			}
 			log.Printf("<%s> >", prefix)
 
-			// Wrap response writer to capture outgoing response
 			loggingWriter := &loggingResponseWriter{
 				ResponseWriter: w,
 				prefix:         prefix,
@@ -102,7 +95,6 @@ func loggerMiddleware(prefix string) MiddlewareFunc {
 
 			next.ServeHTTP(loggingWriter, r)
 
-			// Log outgoing response to client
 			loggingWriter.logResponse()
 		})
 	}
@@ -166,7 +158,6 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
-					// Check if this is an authentication error
 					if authErr, ok := err.(interface {
 						Error() string
 						StatusCode() int
@@ -176,7 +167,6 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 						if statusCode == 401 {
 							log.Printf("<%s> Authentication error: %v", prefix, err)
 
-							// Copy headers from MCP server response to client response
 							headers := authErr.Headers()
 							if headers != nil {
 								for name, values := range headers {
@@ -186,13 +176,11 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 								}
 							}
 
-							// Set status code and send response
 							w.WriteHeader(http.StatusUnauthorized)
 							w.Write([]byte("Unauthorized\n"))
 							return
 						}
 					}
-					// For other panics, return 500
 					log.Printf("<%s> Recovered from panic: %v", prefix, err)
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				}
@@ -202,22 +190,17 @@ func recoverMiddleware(prefix string) MiddlewareFunc {
 	}
 }
 
-// new401DetectionMiddleware creates middleware that detects 401 errors in JSON-RPC responses
-// and sets the HTTP status code to 401 to signal clients that authentication needs refresh
-func new401DetectionMiddleware(serverName string) MiddlewareFunc {
+func newAuthErrorDetectionMiddleware(serverName string) MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Create a response wrapper to capture the response
 			wrapper := &responseWrapper{
 				ResponseWriter: w,
-				statusCode:     http.StatusOK, // Default status
+				statusCode:     http.StatusOK,
 				serverName:     serverName,
 			}
 
-			// Call the next handler with our wrapper
 			next.ServeHTTP(wrapper, r)
 
-			// After the handler completes, check if we need to modify the status
 			wrapper.finalizeResponse()
 		})
 	}
@@ -241,7 +224,6 @@ func (rw *responseWrapper) WriteHeader(statusCode int) {
 	rw.statusCode = statusCode
 	rw.checkIfStreaming()
 
-	// If streaming, write headers immediately
 	if rw.isStreaming {
 		rw.ResponseWriter.WriteHeader(rw.statusCode)
 		rw.headerWritten = true
@@ -254,7 +236,6 @@ func (rw *responseWrapper) checkIfStreaming() {
 	}
 	rw.checkedStreaming = true
 
-	// Check if this is a streaming response (SSE or other streaming types)
 	contentType := rw.Header().Get("Content-Type")
 	rw.isStreaming = strings.Contains(contentType, "text/event-stream") ||
 		strings.Contains(contentType, "application/x-ndjson") ||
@@ -264,7 +245,6 @@ func (rw *responseWrapper) checkIfStreaming() {
 func (rw *responseWrapper) Write(data []byte) (int, error) {
 	rw.checkIfStreaming()
 
-	// For streaming responses, pass through immediately
 	if rw.isStreaming {
 		if !rw.headerWritten {
 			if rw.statusCode == 0 {
@@ -276,7 +256,6 @@ func (rw *responseWrapper) Write(data []byte) (int, error) {
 		return rw.ResponseWriter.Write(data)
 	}
 
-	// For non-streaming, buffer the response
 	rw.bodyBuf = append(rw.bodyBuf, data...)
 	return len(data), nil
 }
@@ -286,26 +265,20 @@ func (rw *responseWrapper) finalizeResponse() {
 		return
 	}
 
-	// Check if this is a JSON response that might contain a 401 error
 	contentType := rw.Header().Get("Content-Type")
 	if strings.Contains(contentType, "application/json") && len(rw.bodyBuf) > 0 {
-		// Parse as JSON to check for errors
 		bodyStr := string(rw.bodyBuf)
 
-		// Check for JSON-RPC error with 401 patterns
-		// Look for error objects containing 401, "Unauthorized", or "unauthorized"
 		if strings.Contains(bodyStr, `"error"`) &&
 			(strings.Contains(bodyStr, "401") ||
 				strings.Contains(bodyStr, "Unauthorized") ||
 				strings.Contains(bodyStr, "unauthorized")) {
 
-			// Change status to 401
 			log.Printf("<%s> Detected 401 error in response, setting HTTP status to 401", rw.serverName)
 			rw.statusCode = http.StatusUnauthorized
 		}
 	}
 
-	// Now write the actual response
 	if rw.statusCode == 0 {
 		rw.statusCode = http.StatusOK
 	}
@@ -349,12 +322,10 @@ func startHTTPServer(config *Config) error {
 			continue
 		}
 
-		// Set base URL to scheme://host (strip path)
 		serverBaseURL.Path = ""
 		serverBaseURL.RawQuery = ""
 		serverBaseURL.Fragment = ""
 
-		// Register discovery endpoints with server name prefix
 		registerDiscoveryEndpoints(httpMux, name, serverBaseURL.String())
 		log.Printf("<%s> Registered OAuth discovery endpoints", name)
 	}
@@ -369,22 +340,17 @@ func startHTTPServer(config *Config) error {
 			return err
 		}
 
-		// Register route immediately, regardless of initialization status
-		// This allows OAuth-protected servers to receive requests with Authorization headers
 		middlewares := make([]MiddlewareFunc, 0)
 		middlewares = append(middlewares, recoverMiddleware(name))
 		if clientConfig.Options.LogEnabled.OrElse(false) {
 			middlewares = append(middlewares, loggerMiddleware(name))
 		}
-		// For OAuth-protected servers, require Authorization header (but don't validate token)
 		if mcpClient.needLazyLoad {
 			middlewares = append(middlewares, newOAuthRequiredMiddleware(name))
 		} else if len(clientConfig.Options.AuthTokens) > 0 {
-			// For non-OAuth servers with configured tokens, validate against token list
 			middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
 		}
-		// Add 401 detection middleware to propagate authentication errors to clients
-		middlewares = append(middlewares, new401DetectionMiddleware(name))
+		middlewares = append(middlewares, newAuthErrorDetectionMiddleware(name))
 		mcpRoute := path.Join(baseURL.Path, name)
 		if !strings.HasPrefix(mcpRoute, "/") {
 			mcpRoute = "/" + mcpRoute
@@ -395,7 +361,6 @@ func startHTTPServer(config *Config) error {
 		log.Printf("<%s> Handling requests at %s", name, mcpRoute)
 		httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
 
-		// Initialize in background
 		errorGroup.Go(func() error {
 			log.Printf("<%s> Connecting", name)
 			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
@@ -474,21 +439,17 @@ func registerDiscoveryEndpoints(mux *http.ServeMux, serverName, backendURL strin
 		mux.HandleFunc(path, createProxyHandler(backendURL, discoveryPath, serverName))
 	}
 
-	// Register dynamic client registration endpoint
 	registerPath := "/" + serverName + "/register"
 	mux.HandleFunc(registerPath, createProxyHandler(backendURL, "/register", serverName))
 }
 
-// createProxyHandler creates an HTTP handler that proxies requests to a backend server
 func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Build target URL
 		target := backendURL + targetPath
 		if r.URL.RawQuery != "" {
 			target += "?" + r.URL.RawQuery
 		}
 
-		// Create proxy request
 		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 		if err != nil {
 			log.Printf("<%s> Failed to create proxy request: %v", serverName, err)
@@ -496,18 +457,15 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 			return
 		}
 
-		// Copy headers from original request
 		for name, values := range r.Header {
 			for _, value := range values {
 				proxyReq.Header.Add(name, value)
 			}
 		}
 
-		// Set/override Host header to backend
 		backendURLParsed, _ := url.Parse(backendURL)
 		proxyReq.Host = backendURLParsed.Host
 
-		// Log outgoing request to backend MCP server
 		log.Printf("<%s> ≥ %s %s %s", serverName, proxyReq.Method, proxyReq.URL.RequestURI(), proxyReq.Proto)
 		log.Printf("<%s> ≥ Host: %s", serverName, proxyReq.Host)
 		for name, values := range proxyReq.Header {
@@ -517,7 +475,6 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 		}
 		log.Printf("<%s> ≥", serverName)
 
-		// Execute proxy request
 		client := &http.Client{
 			Timeout: 30 * time.Second,
 		}
@@ -529,7 +486,6 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 		}
 		defer resp.Body.Close()
 
-		// Log incoming response from backend MCP server
 		log.Printf("<%s> < HTTP/1.1 %d %s", serverName, resp.StatusCode, resp.Status)
 		for name, values := range resp.Header {
 			for _, value := range values {
@@ -538,14 +494,12 @@ func createProxyHandler(backendURL, targetPath, serverName string) http.HandlerF
 		}
 		log.Printf("<%s> <", serverName)
 
-		// Copy response headers
 		for name, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(name, value)
 			}
 		}
 
-		// Write response status and body
 		w.WriteHeader(resp.StatusCode)
 		if _, err := io.Copy(w, resp.Body); err != nil {
 			log.Printf("<%s> Failed to write proxy response: %v", serverName, err)
